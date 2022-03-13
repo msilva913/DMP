@@ -199,87 +199,85 @@ function solve_model_time_iter(E_mat, para::Para; tol=1e-7, max_iter=1000, verbo
 end
 
 
-function simulate_series(E_pol, para, burn_in=200, capT=10000)
+function simulate_series(E_mat, para, burn_in=200, capT=10000)
 
-    @unpack k, α_L, z, s, η_L, β, ρ_x, stdx, NU, NS, A, mc = para
+    @unpack k, α_L, z, s, η_L, β, ρ_x, stdx, NU, NS, A, mc, u_grid = para
     capT = capT + burn_in + 1
 
-    # Extract indices of simualtes shocks
-    x_indices = simulate_indices(mc, capT)
-    x_series = A[x_indices]
-    # Simulate shocks
-    u = ones(capT+1)*0.05
-    M = ones(capT, 4)
-    f, θ, v, w = columns(M)
+    # bivariate interpolation
+    E_pol = Spline2D(u_grid, A, E_mat)
 
+    # draw shocks
+    d = Normal(0, stdx)
+    η_x = rand(d, capT)
+    x = zeros(capT)
+    for t in 1:(capT-1)
+        x[t+1] = ρ_x*x[t] + η_x[t+1]
+    end
+    x = exp.(x)
+
+    u = ones(capT+1)*0.05
+    M = ones(capT, 5)
+    f, θ, v, w, E = columns(M)
+    
     for t in 1:capT
         # interpolate E
-        E = E_pol(u[t], x_indices[t])
+        E[t] = E_pol(u[t], x[t])
         # recover policies and next-period unemployment from interpolation
-        __, θ[t], f[t], v[t], w[t], u[t+1] = get_policies(E, u[t], x_series[t], para)
+        __, θ[t], f[t], v[t], w[t], u[t+1] = get_policies(E[t], u[t], x[t], para)
     end
     # remove last element of u
     pop!(u)
     # remove burn-in
-    out = [θ f v w u x_series x_indices][(burn_in+1):end, :]
-    θ, f, v, w, u, x, x_indices = columns(out)
-    Simulation = (θ=θ, f=f, v=v, w=w, u=u, x=x, x_indices=x_indices)
+    out = [θ f v w u x][(burn_in+1):end, :]
+    θ, f, v, w, u, x = columns(out)
+    Simulation = (θ=θ, f=f, v=v, w=w, u=u, x=x)
     return Simulation
 end
 
 
-function impulse_response(l_mat, para, k_init; irf_length=40, scale=1.0)
+function impulse_response(E_mat, para; u_init=0.07, irf_length=60, scale=1.0)
 
-    @unpack rhox, stdx, P, mc, A, alpha, theta, delta, k_grid, NK, NS = para
+    @unpack k, α_L, z, s, η_L, β, ρ_x, stdx, NU, NS, A, mc, u_grid = para
 
-    # Bivariate interpolation (AR(1) shocks, so productivity can go off grid)
-    L = Spline2D(k_grid, A, l_mat)
+    # bivariate interpolation
+    E_pol = Spline2D(u_grid, A, E_mat)
 
-    eta_x = zeros(irf_length)
-    eta_x[1] = stdx*scale
+    # draw shocks
+    x = zeros(irf_length)
+    x[1] = stdx*scale
     for t in 1:(irf_length-1)
-        eta_x[t+1] = rhox*eta_x[t]
+        x[t+1] = ρ_x*x[t]
     end
-    z = exp.(eta_x)
-    z_bas = ones(irf_length)
+    x = exp.(x)
+    # counterfactual
+    x_bas = ones(irf_length)
 
-    function impulse(z_series)
-
-        k = zeros(irf_length+1)
-        l = zeros(irf_length)
-        c = zeros(irf_length)
-        y = zeros(irf_length)
-
-        k[1] = k_init
-
+    function impulse(x_series)
+        u = ones(irf_length+1)
+        u[1] = u_init
+        M = ones(irf_length, 5)
+        f, θ, v, w, E = columns(M)
+        
         for t in 1:irf_length
-            # labor
-            l[t] = L(k[t], z_series[t])
-            y[t] = z_series[t]*k[t]^alpha*l[t]^(1-alpha)
-            c[t] = (1-l[t])/theta*(1-alpha)*y[t]/l[t]
-            k[t+1] = (1-delta)*k[t] + y[t] - c[t]
+            # interpolate E
+            E[t] = E_pol(u[t], x_series[t])
+            # recover policies and next-period unemployment from interpolation
+            __, θ[t], f[t], v[t], w[t], u[t+1] = get_policies(E[t], u[t], x_series[t], para)
         end
-
-        k = k[1:(end-1)]
-        i = y - c
-        w = (1-alpha).*y./l
-        R = alpha.*y./k
-        lab_prod = y./l
-        out = [c k l i w R y lab_prod]
+        # remove last element of u
+        pop!(u)
+        out = [θ f v w u x_series M]
         return out
     end
 
-    out_imp = impulse(z)
-    out_bas = impulse(z_bas)
+    out_imp = impulse(x)
+    out_bas = impulse(x_bas)
 
     irf_res = similar(out_imp)
     @. irf_res = 100*log(out_imp/out_bas)
-    #out = [log.(x./mean(getfield(simul, field))) for (x, field) in
-    #zip([c, k[1:(end-1)], l, i, w, R, y, lab_prod], [:c, :k, :l, :i, :w, :R, :y, :lab_prod])]
-    c, k, l, i, w, R, y, lab_prod = [irf_res[:, i] for i in 1:size(irf_res, 2)]
-
-    irf = (l=l, y=y, c=c, k=k, i=i, w=w, R=R,
-                 lab_prod=lab_prod, eta_x=100*log.(z))
+    θ, f, v, w, u, x = columns(irf_res)
+    irf = (θ=θ, f=f, v=v, w=w, u=u, x=x)
     return irf
 end
 
@@ -304,6 +302,8 @@ end
 cal = calibrate(stdx=0.015)
 @unpack k, α_L, z, s, η_L, β, ρ_x, stdx = cal
 
+ss = steady_state(cal)
+
 # form struct using calibrated parameters
 para = Para(k=k, α_L=α_L, z=z, s=s, η_L=η_L, β=β, ρ_x=ρ_x, stdx=stdx)
 @unpack NU, NS, u_grid = para
@@ -316,7 +316,7 @@ E_mat .= 2.0
 E_mat, E_pol, X, q, f, v, w = solve_model_time_iter(E_mat, para)
 
 # Simulate model
-simul = simulate_series(E_pol, para)
+simul = simulate_series(E_mat, para)
 
 # Log deviations from stationary mean
 out = [log.(getfield(simul, x)./mean(getfield(simul, x))) for x in keys(simul)]
@@ -345,32 +345,41 @@ ax[3].legend()
 display(fig)
 PyPlot.savefig("simulations.pdf")
 
+" Impulse responses "
+irf =impulse_response(E_mat, para, u_init=ss.u)
+
+fig, ax = plt.subplots(1, 3, figsize=(20, 5))
+    ax[1].plot(irf.θ, label="θ")
+    ax[1].plot(irf.v, label="v")
+    ax[1].legend(loc="best")
+    ax[1].set_title("Market tightness and vacancies")
+    
+    ax[2].plot(irf.u, label="u")
+    ax[2].plot(irf.f, label="f")
+    ax[2].legend(loc="best")
+    ax[2].set_title("Unemployment and the job finding rate")
+    
+    ax[3].plot(irf.x, label="x")
+    ax[3].plot(irf.w, label="w")
+    ax[3].legend(loc="best")
+    ax[3].set_title("Productivity shock and wages")
+    tight_layout()
+    display(fig)
+    PyPlot.savefig("irfs.pdf")
+
+" Beveridge curve "
+fig, ax = plt.subplots()
+ax.scatter(x=simul.u, y=simul.θ, label="Beveridge curve", alpha=0.6, s=0.3)
+ax.set_xlabel("u")
+ax.set_ylabel("θ")
+tight_layout()
+display(fig)
+PyPlot.savefig("Beveridge_curve.pdf")
+
 # " Residuals "
 # res = residual(l_pol, simul, para)
 
-# " Impulse responses "
-# k_1 = mean(simul.k)
-# irf = impulse_response(l_mat, para, k_1, irf_length=60)
 
-# fig, ax = subplots(1, 3, figsize=(20, 5))
-# ax[1].plot(irf.c, label="c")
-# ax[1].plot(irf.i, label="i")
-# ax[1].plot(irf.l, label="l")
-# ax[1].plot(irf.y, label="y")
-# ax[1].set_title("Consumption, investmnt, output, and labor supply")
-# ax[1].legend()
-
-# ax[2].plot(irf.w, label="w")
-# ax[2].plot(irf.R, label="R")
-# ax[2].set_title("Wage and rental rate of capital")
-# ax[2].legend()
-
-# ax[3].plot(irf.eta_x, label="x")
-# ax[3].plot(irf.lab_prod, label="Labor productivity")
-# ax[3].set_title("Total factor and labor productivity")
-# ax[3].legend()
-# display(fig)
-# PyPlot.savefig("rbc_irf.pdf")
 
 # " Moments from simulated data "
 # # convert to Pandas DataFrame
