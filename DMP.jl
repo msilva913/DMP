@@ -128,7 +128,8 @@ function get_policies(E, u, x, para)
     return q, θ, f, v, w, u_p
 end
 
-function rhs_jcc(E_pol, iu, ix, para::Para)
+function rhs_jcc(E_pol, iu, ix, para)
+    # Right-hand side for particular state
     @unpack k, α_L, z, s, η_L, β, NU, NS, u_grid, A, P = para
     # Reconstruct right-hand side of Euler
     u = u_grid[iu]
@@ -138,7 +139,7 @@ function rhs_jcc(E_pol, iu, ix, para::Para)
     # extract policies and next-period unemployment
     q, θ, f, v, w, u_p= get_policies(E, u, x, para)
     E_new = 0.0
-    for ix_p in 1:NS
+    @inbounds @simd for ix_p in 1:NS
         x_p = A[ix_p]
         E_p = E_pol(u_p, ix_p)
         q_p, θ_p, f_p, v_p, w_p, u_p2 = get_policies(E_p, u_p, x_p, para)
@@ -149,18 +150,18 @@ function rhs_jcc(E_pol, iu, ix, para::Para)
 end
 
 
-function solve_model_time_iter(E_mat, para::Para; tol=1e-7, max_iter=1000, verbose=true, 
+function solve_model_time_iter(E_mat, para; tol=1e-7, max_iter=1000, verbose=true, 
                                 print_skip=25, ω=0.7)
     # Set up loop 
     @unpack k, α_L, z, s, η_L, β, NU, NS, u_grid, A, P = para
     
     err = 1
     iter = 1
-    E_pol(u, ix) = Interpolate(u_grid, @view(E_mat[:, ix]), extrapolate=:reflect)(u)
     while (iter < max_iter) && (err > tol)
+        E_pol(u, ix) = Interpolate(u_grid, @view(E_mat[:, ix]), extrapolate=:reflect)(u)
         # interpolate given grid on EE
         E_new = zeros(NU, NS)
-        for (iu, u) in enumerate(u_grid)
+        @inbounds for (iu, u) in collect(enumerate(u_grid))
             for ix in 1:NS
                 # new right-hand side of EE given iu, ix
                 E_new[iu, ix] = rhs_jcc(E_pol, iu, ix, para)
@@ -174,9 +175,8 @@ function solve_model_time_iter(E_mat, para::Para; tol=1e-7, max_iter=1000, verbo
         iter += 1
         # update grid of rhs of EE
         E_mat = E_new
-        E_pol(u, ix) = Interpolate(u_grid, @view(E_mat[:, ix]), extrapolate=:reflect)(u)
     end
-
+    E_pol(u, ix) = Interpolate(u_grid, @view(E_mat[:, ix]), extrapolate=:reflect)(u)
     # Get convergence level
     if iter == max_iter
         print("Failed to converge!")
@@ -310,7 +310,7 @@ para = Para(k=k, α_L=α_L, z=z, s=s, η_L=η_L, β=β, ρ_x=ρ_x, stdx=stdx)
 
 # initial guess of rhs jcc
 E_mat = zeros(NU, NS)
-E_mat .= 2.0
+E_mat .= k/ss.q
 
 # Solve model: iterating on the job creation condition
 E_mat, E_pol, X, q, f, v, w = solve_model_time_iter(E_mat, para)
@@ -320,7 +320,7 @@ simul = simulate_series(E_mat, para)
 
 # Log deviations from stationary mean
 out = [log.(getfield(simul, x)./mean(getfield(simul, x))) for x in keys(simul)]
-θ_sim, f_sim, v_sim, w_sim, u_sim, x_sim, __ = [out[i] for i in 1:length(out)]
+θ_sim, f_sim, v_sim, w_sim, u_sim, x_sim = [out[i] for i in 1:length(out)]
 
 # DataFrame of log deviations
 simul_dat = DataFrames.DataFrame(θ=θ_sim, f=f_sim, v=v_sim, w=w_sim, u=u_sim, x=x_sim)
@@ -376,15 +376,36 @@ tight_layout()
 display(fig)
 PyPlot.savefig("Beveridge_curve.pdf")
 
-# " Residuals "
-# res = residual(l_pol, simul, para)
+function residual(E_mat, simul, para::Para; burn_in=200)
+    capT = size(simul.u)[1]
+    resids = zeros(capT)
+    @unpack k, β, NU, NS, u_grid, P = para
+    @unpack u, f, θ, x = simul
+    q = f./θ
+    E_pol_fun(u, ix) = Interpolate(u_grid, @view(E_mat[:, ix]), extrapolate=:reflect)(u)
 
 
+    E_sim = 0.0
+    for t in 1:capT
+        for ix_p in 1:NS
+            x_p = A[ix_p]
+            E_p = E_pol(u[t+1], ix_p)
+            q_p, θ_p, f_p, v_p, w_p, u_p2 = get_policies(E_p, u[t+1], x_p, para)
+            # add job surplus under realization ix_p
+            E_sim[t] += P[ix, ix_p]*β*(x_p-w_p + (1-s)*(k/q_p))
+        end
+    end
 
-# " Moments from simulated data "
-# # convert to Pandas DataFrame
-# #simul_dat = Pandas.DataFrame(simul_dat)
-# mom = moments(simul_dat)
+    loss = k./q - E_sim
+    " Pre-allocate arrays "
+    basis_mat = zeros(2, size(P)[1])
+    rhs_fun = RHS_fun_cons(l_pol, para)
+
+    " Right-hand side of Euler equation "
+    rhs = rhs_fun.(k, z_indices)
+    loss = 1.0 .- simul.c .* rhs
+    return loss[burn_in:end]
+end  
       
 
 
